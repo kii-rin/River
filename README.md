@@ -1,20 +1,15 @@
 # River online price prediction
 
 A minimal online linear-regression experiment with no train/test split.
-Every numeric price column is automatically used in two ways:
-
-- as an input feature
-- as its own prediction target
-
-A separate River model is maintained for each asset.
+All price columns are used as percentage-change inputs, while one target is selected with `--target`.
 
 For every new row:
 
-1. The previous predictions are compared with the newly revealed returns.
-2. All resolved predictions are appended to `predictions.csv`.
-3. Each target model learns from that one example with `learn_one`.
-4. Current percentage movements are used to predict every asset's next return.
-5. The latest predictions remain pending until another row arrives.
+1. The previous prediction is compared with the newly revealed target return.
+2. The result is appended to `predictions.csv`.
+3. The model learns from that one example with `learn_one`.
+4. Current percentage movements are used to predict the target's next return.
+5. The latest prediction remains pending until another row arrives.
 
 The percentage-change formula is:
 
@@ -42,38 +37,19 @@ date,EURUSD,GBPUSD,USDJPY,GOLD,OIL_WTI
 Run:
 
 ```bash
-python online.py --mode csv --csv markets.csv
+python online.py --mode csv --csv markets.csv --target EURUSD
 ```
 
-Results are always appended to:
-
-```text
-predictions.csv
-```
-
-The log contains one row per target per resolved timestamp:
-
-```csv
-prediction_date,result_date,target,prediction_percent,actual_percent,error_percent
-```
+Results are always appended to `predictions.csv`.
 
 ## Live mode
 
-Live mode uses the same learning loop and waits until the next row arrives.
-The stdin source can later be replaced by an API stream without changing `run`.
-
 ```bash
 python online.py --mode live \
+  --target EURUSD \
   --columns date EURUSD GBPUSD USDJPY GOLD OIL_WTI
 ```
 
-Then enter one row whenever prices update:
-
-```text
-2026-07-26T12:00:00,1.1700,1.3400,154.20,2400.0,78.0
-2026-07-26T13:00:00,1.1710,1.3390,154.10,2403.0,78.4
-```
-
-The first row establishes prices. The second creates percentage-change features and predictions for every asset. The third resolves those predictions, logs them, updates every model, and creates the next predictions.
+The first row establishes prices. The second creates percentage-change features and the first prediction. The third resolves that prediction, logs it, updates the model, and creates the next prediction.
 
 This is research code, not a trading system or market-data feed.
