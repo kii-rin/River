@@ -1,14 +1,10 @@
-"""Pure online next-return prediction with River.
-
-All price columns are used as percentage-change inputs. One target column is selected
-with --target. CSV mode replays rows immediately; live mode waits for the next row.
-Resolved predictions are always appended to predictions.csv.
-"""
+"""Pure online next-return prediction with River."""
 
 from __future__ import annotations
 
 import argparse
 import csv
+import pickle
 import sys
 from collections.abc import Iterable, Iterator
 from pathlib import Path
@@ -17,7 +13,9 @@ from river import linear_model, preprocessing
 
 
 Row = dict[str, str]
-LOG_PATH = Path("predictions.csv")
+SCRIPT_DIR = Path(__file__).resolve().parent
+LOG_PATH = SCRIPT_DIR / "predictions.csv"
+MODEL_PATH = SCRIPT_DIR / "model"
 
 
 def percentage_change(previous: float, current: float) -> float:
@@ -38,6 +36,25 @@ def make_model():
     return preprocessing.StandardScaler() | linear_model.LinearRegression()
 
 
+def load_model(target: str):
+    if not MODEL_PATH.exists():
+        return make_model()
+
+    with MODEL_PATH.open("rb") as file:
+        saved = pickle.load(file)
+
+    if saved["target"] != target:
+        raise ValueError(
+            f"Saved model targets {saved['target']!r}, not {target!r}. Delete {MODEL_PATH.name} to start fresh."
+        )
+    return saved["model"]
+
+
+def save_model(model, target: str) -> None:
+    with MODEL_PATH.open("wb") as file:
+        pickle.dump({"target": target, "model": model}, file)
+
+
 def csv_rows(path: Path) -> Iterator[Row]:
     with path.open(newline="", encoding="utf-8") as file:
         reader = csv.DictReader(file)
@@ -48,7 +65,6 @@ def csv_rows(path: Path) -> Iterator[Row]:
 
 def live_rows(columns: list[str]) -> Iterator[Row]:
     print("Live columns:", ",".join(columns), file=sys.stderr)
-    print("Enter one comma-separated row at a time. Ctrl-D/Ctrl-Z stops.", file=sys.stderr)
 
     while True:
         try:
@@ -68,7 +84,7 @@ def live_rows(columns: list[str]) -> Iterator[Row]:
 
 
 def run(rows: Iterable[Row], target: str, date_column: str) -> None:
-    model = make_model()
+    model = load_model(target)
     previous: Row | None = None
     pending_x: dict[str, float] | None = None
     pending_prediction: float | None = None
@@ -117,6 +133,7 @@ def run(rows: Iterable[Row], target: str, date_column: str) -> None:
                 )
                 log_file.flush()
                 model.learn_one(pending_x, actual)
+                save_model(model, target)
 
             pending_x = current_x
             pending_prediction = model.predict_one(current_x)
@@ -124,11 +141,7 @@ def run(rows: Iterable[Row], target: str, date_column: str) -> None:
             previous = current
 
     if pending_date is not None:
-        print(
-            f"Prediction from {pending_date} is waiting for the next row. "
-            f"Resolved predictions were logged to {LOG_PATH}.",
-            file=sys.stderr,
-        )
+        print(f"Prediction from {pending_date} is waiting for the next row.", file=sys.stderr)
 
 
 def parse_args() -> argparse.Namespace:
@@ -136,12 +149,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=("csv", "live"), default="csv")
     parser.add_argument("--target", required=True)
     parser.add_argument("--date-column", default="date")
-    parser.add_argument("--csv", type=Path, help="Historical price CSV for CSV mode")
-    parser.add_argument(
-        "--columns",
-        nargs="+",
-        help="Live row columns, including date, target, and input prices",
-    )
+    parser.add_argument("--csv", type=Path)
+    parser.add_argument("--columns", nargs="+")
     return parser.parse_args()
 
 
