@@ -1,8 +1,8 @@
 """Pure online next-return prediction with River.
 
-Every price column is both an input and a prediction target. CSV mode replays rows
-immediately. Live mode blocks until the next row arrives. Results are always appended
-to predictions.csv.
+All price columns are used as percentage-change inputs. One target column is selected
+with --target. CSV mode replays rows immediately; live mode waits for the next row.
+Resolved predictions are always appended to predictions.csv.
 """
 
 from __future__ import annotations
@@ -21,14 +21,12 @@ LOG_PATH = Path("predictions.csv")
 
 
 def percentage_change(previous: float, current: float) -> float:
-    """Return the percentage movement from previous to current."""
     if previous == 0:
         raise ValueError("A previous price is zero, so percentage change is undefined")
     return (current / previous - 1.0) * 100.0
 
 
 def price_changes(previous: Row, current: Row, date_column: str) -> dict[str, float]:
-    """Use every asset's latest percentage movement as a feature."""
     return {
         name: percentage_change(float(previous[name]), float(value))
         for name, value in current.items()
@@ -37,7 +35,6 @@ def price_changes(previous: Row, current: Row, date_column: str) -> dict[str, fl
 
 
 def make_model():
-    """Small online linear model updated one row at a time."""
     return preprocessing.StandardScaler() | linear_model.LinearRegression()
 
 
@@ -50,7 +47,6 @@ def csv_rows(path: Path) -> Iterator[Row]:
 
 
 def live_rows(columns: list[str]) -> Iterator[Row]:
-    """Block until a comma-separated price row arrives on stdin."""
     print("Live columns:", ",".join(columns), file=sys.stderr)
     print("Enter one comma-separated row at a time. Ctrl-D/Ctrl-Z stops.", file=sys.stderr)
 
@@ -71,12 +67,11 @@ def live_rows(columns: list[str]) -> Iterator[Row]:
         yield dict(zip(columns, values, strict=True))
 
 
-def run(rows: Iterable[Row], date_column: str) -> None:
-    """Predict all assets, reveal results, log them, and learn online."""
-    models: dict[str, object] = {}
+def run(rows: Iterable[Row], target: str, date_column: str) -> None:
+    model = make_model()
     previous: Row | None = None
     pending_x: dict[str, float] | None = None
-    pending_predictions: dict[str, float] = {}
+    pending_prediction: float | None = None
     pending_date: str | None = None
 
     log_exists = LOG_PATH.exists() and LOG_PATH.stat().st_size > 0
@@ -99,6 +94,8 @@ def run(rows: Iterable[Row], date_column: str) -> None:
         for current in rows:
             if date_column not in current:
                 raise ValueError(f"Date column {date_column!r} was not found")
+            if target not in current:
+                raise ValueError(f"Target column {target!r} was not found")
 
             if previous is None:
                 previous = current
@@ -106,43 +103,29 @@ def run(rows: Iterable[Row], date_column: str) -> None:
 
             current_x = price_changes(previous, current, date_column)
 
-            if not models:
-                models = {target: make_model() for target in current_x}
-
-            if set(current_x) != set(models):
-                raise ValueError("Price columns changed between rows")
-
-            # The predictions made from the previous feature row are now resolved.
-            if pending_x is not None:
-                for target, model in models.items():
-                    actual = current_x[target]
-                    prediction = pending_predictions[target]
-                    writer.writerow(
-                        {
-                            "prediction_date": pending_date,
-                            "result_date": current[date_column],
-                            "target": target,
-                            "prediction_percent": prediction,
-                            "actual_percent": actual,
-                            "error_percent": actual - prediction,
-                        }
-                    )
-                    model.learn_one(pending_x, actual)
-
+            if pending_x is not None and pending_prediction is not None:
+                actual = current_x[target]
+                writer.writerow(
+                    {
+                        "prediction_date": pending_date,
+                        "result_date": current[date_column],
+                        "target": target,
+                        "prediction_percent": pending_prediction,
+                        "actual_percent": actual,
+                        "error_percent": actual - pending_prediction,
+                    }
+                )
                 log_file.flush()
+                model.learn_one(pending_x, actual)
 
-            # The current cross-market movements predict every asset's next movement.
             pending_x = current_x
-            pending_predictions = {
-                target: model.predict_one(current_x)
-                for target, model in models.items()
-            }
+            pending_prediction = model.predict_one(current_x)
             pending_date = current[date_column]
             previous = current
 
     if pending_date is not None:
         print(
-            f"Predictions from {pending_date} are waiting for the next row. "
+            f"Prediction from {pending_date} is waiting for the next row. "
             f"Resolved predictions were logged to {LOG_PATH}.",
             file=sys.stderr,
         )
@@ -151,12 +134,13 @@ def run(rows: Iterable[Row], date_column: str) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=("csv", "live"), default="csv")
+    parser.add_argument("--target", required=True)
     parser.add_argument("--date-column", default="date")
     parser.add_argument("--csv", type=Path, help="Historical price CSV for CSV mode")
     parser.add_argument(
         "--columns",
         nargs="+",
-        help="Live row columns, including date and all asset prices",
+        help="Live row columns, including date, target, and input prices",
     )
     return parser.parse_args()
 
@@ -173,7 +157,7 @@ def main() -> None:
             raise SystemExit("Live mode requires --columns")
         rows = live_rows(args.columns)
 
-    run(rows, date_column=args.date_column)
+    run(rows, target=args.target, date_column=args.date_column)
 
 
 if __name__ == "__main__":
