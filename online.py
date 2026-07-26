@@ -1,7 +1,8 @@
 """Pure online next-return prediction with River.
 
-CSV mode replays rows immediately. Live mode blocks on stdin until the next row
-arrives. In both modes the order is always: reveal result -> learn -> predict next.
+Every price column is both an input and a prediction target. CSV mode replays rows
+immediately. Live mode blocks until the next row arrives. Results are always appended
+to predictions.csv.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from river import linear_model, preprocessing
 
 
 Row = dict[str, str]
+LOG_PATH = Path("predictions.csv")
 
 
 def percentage_change(previous: float, current: float) -> float:
@@ -26,25 +28,16 @@ def percentage_change(previous: float, current: float) -> float:
 
 
 def price_changes(previous: Row, current: Row, date_column: str) -> dict[str, float]:
-    """Use each asset's latest percentage movement as a model feature."""
-    features: dict[str, float] = {}
-
-    for name, current_value in current.items():
-        if name == date_column:
-            continue
-        if name not in previous:
-            raise ValueError(f"Column {name!r} is missing from the previous row")
-
-        features[name] = percentage_change(
-            float(previous[name]),
-            float(current_value),
-        )
-
-    return features
+    """Use every asset's latest percentage movement as a feature."""
+    return {
+        name: percentage_change(float(previous[name]), float(value))
+        for name, value in current.items()
+        if name != date_column
+    }
 
 
 def make_model():
-    """Small online linear model; both scaling and regression update one row at a time."""
+    """Small online linear model updated one row at a time."""
     return preprocessing.StandardScaler() | linear_model.LinearRegression()
 
 
@@ -78,58 +71,79 @@ def live_rows(columns: list[str]) -> Iterator[Row]:
         yield dict(zip(columns, values, strict=True))
 
 
-def run(rows: Iterable[Row], target: str, date_column: str) -> None:
-    """Predict before learning, then update only when the next result is known."""
-    model = make_model()
+def run(rows: Iterable[Row], date_column: str) -> None:
+    """Predict all assets, reveal results, log them, and learn online."""
+    models: dict[str, object] = {}
     previous: Row | None = None
     pending_x: dict[str, float] | None = None
-    pending_prediction: float | None = None
+    pending_predictions: dict[str, float] = {}
     pending_date: str | None = None
 
-    writer = csv.DictWriter(
-        sys.stdout,
-        fieldnames=["date", "prediction_percent", "actual_percent", "error_percent"],
-    )
-    writer.writeheader()
+    log_exists = LOG_PATH.exists() and LOG_PATH.stat().st_size > 0
 
-    for current in rows:
-        if target not in current:
-            raise ValueError(f"Target column {target!r} was not found")
-        if date_column not in current:
-            raise ValueError(f"Date column {date_column!r} was not found")
-
-        if previous is None:
-            previous = current
-            continue
-
-        current_x = price_changes(previous, current, date_column)
-        actual_return = percentage_change(
-            float(previous[target]),
-            float(current[target]),
+    with LOG_PATH.open("a", newline="", encoding="utf-8") as log_file:
+        writer = csv.DictWriter(
+            log_file,
+            fieldnames=[
+                "prediction_date",
+                "result_date",
+                "target",
+                "prediction_percent",
+                "actual_percent",
+                "error_percent",
+            ],
         )
+        if not log_exists:
+            writer.writeheader()
 
-        # The previous feature row predicted the return that has just arrived.
-        if pending_x is not None and pending_prediction is not None:
-            writer.writerow(
-                {
-                    "date": current[date_column],
-                    "prediction_percent": pending_prediction,
-                    "actual_percent": actual_return,
-                    "error_percent": actual_return - pending_prediction,
-                }
-            )
-            sys.stdout.flush()
-            model.learn_one(pending_x, actual_return)
+        for current in rows:
+            if date_column not in current:
+                raise ValueError(f"Date column {date_column!r} was not found")
 
-        # Today's cross-market movements predict the target's next movement.
-        pending_x = current_x
-        pending_prediction = model.predict_one(current_x)
-        pending_date = current[date_column]
-        previous = current
+            if previous is None:
+                previous = current
+                continue
+
+            current_x = price_changes(previous, current, date_column)
+
+            if not models:
+                models = {target: make_model() for target in current_x}
+
+            if set(current_x) != set(models):
+                raise ValueError("Price columns changed between rows")
+
+            # The predictions made from the previous feature row are now resolved.
+            if pending_x is not None:
+                for target, model in models.items():
+                    actual = current_x[target]
+                    prediction = pending_predictions[target]
+                    writer.writerow(
+                        {
+                            "prediction_date": pending_date,
+                            "result_date": current[date_column],
+                            "target": target,
+                            "prediction_percent": prediction,
+                            "actual_percent": actual,
+                            "error_percent": actual - prediction,
+                        }
+                    )
+                    model.learn_one(pending_x, actual)
+
+                log_file.flush()
+
+            # The current cross-market movements predict every asset's next movement.
+            pending_x = current_x
+            pending_predictions = {
+                target: model.predict_one(current_x)
+                for target, model in models.items()
+            }
+            pending_date = current[date_column]
+            previous = current
 
     if pending_date is not None:
         print(
-            f"Waiting for the next row to reveal the result of the prediction made at {pending_date}.",
+            f"Predictions from {pending_date} are waiting for the next row. "
+            f"Resolved predictions were logged to {LOG_PATH}.",
             file=sys.stderr,
         )
 
@@ -137,13 +151,12 @@ def run(rows: Iterable[Row], target: str, date_column: str) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=("csv", "live"), default="csv")
-    parser.add_argument("--target", default="EURUSD")
     parser.add_argument("--date-column", default="date")
     parser.add_argument("--csv", type=Path, help="Historical price CSV for CSV mode")
     parser.add_argument(
         "--columns",
         nargs="+",
-        help="Live row columns, including date and target",
+        help="Live row columns, including date and all asset prices",
     )
     return parser.parse_args()
 
@@ -160,7 +173,7 @@ def main() -> None:
             raise SystemExit("Live mode requires --columns")
         rows = live_rows(args.columns)
 
-    run(rows, target=args.target, date_column=args.date_column)
+    run(rows, date_column=args.date_column)
 
 
 if __name__ == "__main__":
