@@ -1,13 +1,20 @@
 # River online price prediction
 
-A minimal online linear-regression experiment. There is no train/test split.
-Every row is handled in chronological order:
+A minimal online linear-regression experiment with no train/test split.
+Every numeric price column is automatically used in two ways:
 
-1. A new price row arrives.
-2. The previous prediction is compared with the newly revealed target return.
-3. The model learns from that one example with `learn_one`.
-4. Current percentage movements are used to predict the target's next return.
-5. The final prediction remains pending until another row arrives.
+- as an input feature
+- as its own prediction target
+
+A separate River model is maintained for each asset.
+
+For every new row:
+
+1. The previous predictions are compared with the newly revealed returns.
+2. All resolved predictions are appended to `predictions.csv`.
+3. Each target model learns from that one example with `learn_one`.
+4. Current percentage movements are used to predict every asset's next return.
+5. The latest predictions remain pending until another row arrives.
 
 The percentage-change formula is:
 
@@ -23,7 +30,7 @@ pip install -r requirements.txt
 
 ## CSV mode
 
-The CSV must contain prices, not precomputed returns, and must already be sorted oldest to newest.
+The CSV must contain prices, not precomputed returns, and must be sorted oldest to newest.
 
 ```csv
 date,EURUSD,GBPUSD,USDJPY,GOLD,OIL_WTI
@@ -35,28 +42,28 @@ date,EURUSD,GBPUSD,USDJPY,GOLD,OIL_WTI
 Run:
 
 ```bash
-python online.py --mode csv --csv markets.csv --target EURUSD
+python online.py --mode csv --csv markets.csv
 ```
 
-The program writes simple rows to stdout:
+Results are always appended to:
+
+```text
+predictions.csv
+```
+
+The log contains one row per target per resolved timestamp:
 
 ```csv
-date,prediction_percent,actual_percent,error_percent
-```
-
-Save them when desired:
-
-```bash
-python online.py --mode csv --csv markets.csv --target EURUSD > predictions.csv
+prediction_date,result_date,target,prediction_percent,actual_percent,error_percent
 ```
 
 ## Live mode
 
-Live mode uses the exact same learning loop and blocks until you enter the next row. This stdin interface is deliberately simple and can later be replaced by an API stream without changing `run`.
+Live mode uses the same learning loop and waits until the next row arrives.
+The stdin source can later be replaced by an API stream without changing `run`.
 
 ```bash
 python online.py --mode live \
-  --target EURUSD \
   --columns date EURUSD GBPUSD USDJPY GOLD OIL_WTI
 ```
 
@@ -67,6 +74,6 @@ Then enter one row whenever prices update:
 2026-07-26T13:00:00,1.1710,1.3390,154.10,2403.0,78.4
 ```
 
-The first row establishes prices. The second creates the first feature vector and prediction. The third row reveals whether that prediction was right, updates the model, and produces the next prediction.
+The first row establishes prices. The second creates percentage-change features and predictions for every asset. The third resolves those predictions, logs them, updates every model, and creates the next predictions.
 
 This is research code, not a trading system or market-data feed.
